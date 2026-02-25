@@ -1,121 +1,84 @@
-/**
- * db.js — Capa de datos con JSON (Railway-ready)
- * Fácilmente migrable a PostgreSQL añadiendo un adaptador.
- */
-const fs   = require('fs');
-const path = require('path');
+const { MongoClient } = require('mongodb');
 
-const DATA_DIR    = path.join(__dirname, '..', 'data');
-const CLIENTS_F   = path.join(DATA_DIR, 'clients.json');
-const LEADS_F     = path.join(DATA_DIR, 'leads.json');
-const CONVS_F     = path.join(DATA_DIR, 'conversations.json');
+const uri = process.env.MONGODB_URI;
+let db = null;
 
-// ── Helpers ───────────────────────────────────────────────────
-function readJSON(file) {
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
-  catch { return []; }
+async function getDB() {
+  if (db) return db;
+  const client = new MongoClient(uri);
+  await client.connect();
+  db = client.db('autocerebra');
+  return db;
 }
 
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+async function getClients() {
+  const database = await getDB();
+  return database.collection('clients').find({}).toArray();
 }
 
-// ── CLIENTS ───────────────────────────────────────────────────
-function getClients() { return readJSON(CLIENTS_F); }
-
-function getClientById(id) {
-  return getClients().find(c => c.id === id) || null;
+async function getClientById(id) {
+  const database = await getDB();
+  return database.collection('clients').findOne({ id });
 }
 
-function getClientBySlug(slug) {
-  return getClients().find(c => c.slug === slug) || null;
+async function getClientBySlug(slug) {
+  const database = await getDB();
+  return database.collection('clients').findOne({ slug });
 }
 
-function saveClient(clientData) {
-  const clients = getClients();
-  const idx = clients.findIndex(c => c.id === clientData.id);
-  if (idx >= 0) {
-    clients[idx] = { ...clients[idx], ...clientData, updatedAt: new Date().toISOString() };
+async function saveClient(clientData) {
+  const database = await getDB();
+  const existing = await getClientById(clientData.id);
+  if (existing) {
+    await database.collection('clients').updateOne({ id: clientData.id }, { $set: { ...clientData, updatedAt: new Date().toISOString() } });
   } else {
-    clients.push({ ...clientData, createdAt: new Date().toISOString(), stats: { conversations: 0, leadsCapture: 0, appointmentsBooked: 0 } });
+    await database.collection('clients').insertOne({ ...clientData, createdAt: new Date().toISOString(), stats: { conversations: 0, leadsCapture: 0, appointmentsBooked: 0 } });
   }
-  writeJSON(CLIENTS_F, clients);
-  return idx >= 0 ? clients[idx] : clients[clients.length - 1];
+  return getClientById(clientData.id);
 }
 
-function deleteClient(id) {
-  const clients = getClients().filter(c => c.id !== id);
-  writeJSON(CLIENTS_F, clients);
+async function deleteClient(id) {
+  const database = await getDB();
+  await database.collection('clients').deleteOne({ id });
 }
 
-// ── LEADS ─────────────────────────────────────────────────────
-function getLeads(clientId) {
-  const all = readJSON(LEADS_F);
-  return clientId ? all.filter(l => l.clientId === clientId) : all;
+async function getLeads(clientId) {
+  const database = await getDB();
+  const query = clientId ? { clientId } : {};
+  return database.collection('leads').find(query).sort({ capturedAt: -1 }).toArray();
 }
 
-function saveLead(lead) {
-  const leads = readJSON(LEADS_F);
-  leads.push({ ...lead, id: `lead_${Date.now()}` });
-  writeJSON(LEADS_F, leads);
+async function saveLead(lead) {
+  const database = await getDB();
+  await database.collection('leads').insertOne({ ...lead, id: `lead_${Date.now()}` });
 }
 
-// ── CONVERSATIONS ─────────────────────────────────────────────
-const conversationCache = new Map(); // In-memory cache for active sessions
-
-function saveConversation(sessionId, clientId, messages) {
-  // Cache in memory (fast)
-  conversationCache.set(sessionId, { clientId, messages, updatedAt: Date.now() });
-
-  // Persist only last 100 conversations to avoid huge files
-  const convs = readJSON(CONVS_F);
-  const idx = convs.findIndex(c => c.sessionId === sessionId);
-  const entry = { sessionId, clientId, messages: messages.slice(-30), updatedAt: new Date().toISOString() };
-
-  if (idx >= 0) convs[idx] = entry;
-  else convs.push(entry);
-
-  // Keep only last 500 conversations in file
-  if (convs.length > 500) convs.splice(0, convs.length - 500);
-  writeJSON(CONVS_F, convs);
+async function saveConversation(sessionId, clientId, messages) {
+  const database = await getDB();
+  await database.collection('conversations').updateOne(
+    { sessionId },
+    { $set: { sessionId, clientId, messages: messages.slice(-30), updatedAt: new Date().toISOString() } },
+    { upsert: true }
+  );
 }
 
-function getConversationHistory(sessionId) {
-  // Try cache first
-  if (conversationCache.has(sessionId)) {
-    return conversationCache.get(sessionId).messages;
-  }
-  // Fallback to file
-  const convs = readJSON(CONVS_F);
-  const found = convs.find(c => c.sessionId === sessionId);
-  return found?.messages || [];
+async function getConversationHistory(sessionId) {
+  const database = await getDB();
+  const conv = await database.collection('conversations').findOne({ sessionId });
+  return conv?.messages || [];
 }
 
-function getConversationsByClient(clientId, limit = 50) {
-  const convs = readJSON(CONVS_F);
-  return convs
-    .filter(c => c.clientId === clientId)
-    .slice(-limit)
-    .reverse();
+async function getConversationsByClient(clientId, limit = 50) {
+  const database = await getDB();
+  return database.collection('conversations').find({ clientId }).sort({ updatedAt: -1 }).limit(limit).toArray();
 }
 
-// Limpiar sesiones viejas de memoria cada hora
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, val] of conversationCache.entries()) {
-    if (now - val.updatedAt > 3600000) conversationCache.delete(key); // 1h
-  }
-}, 3600000);
-
-// ── STATS ─────────────────────────────────────────────────────
 async function updateClientStats(clientId, field) {
-  const clients = getClients();
-  const idx = clients.findIndex(c => c.id === clientId);
-  if (idx < 0) return;
-  if (!clients[idx].stats) clients[idx].stats = {};
-  clients[idx].stats[field] = (clients[idx].stats[field] || 0) + 1;
-  clients[idx].stats.lastActivity = new Date().toISOString();
-  writeJSON(CLIENTS_F, clients);
+  const database = await getDB();
+  await database.collection('clients').updateOne(
+    { id: clientId },
+    { $inc: { [`stats.${field}`]: 1 }, $set: { 'stats.lastActivity': new Date().toISOString() } }
+  );
 }
 
 module.exports = {
@@ -125,3 +88,13 @@ module.exports = {
   saveConversation, getConversationHistory, getConversationsByClient,
   updateClientStats,
 };
+```
+
+Luego también tienes que añadir `mongodb` al `package.json`. Ve a **`package.json`** → lápiz ✏️ → busca la línea:
+```
+"express": "^4.18.2",
+```
+
+Y añade justo debajo:
+```
+"mongodb": "^6.3.0",
