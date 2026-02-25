@@ -88,13 +88,3 @@ module.exports = {
   saveConversation, getConversationHistory, getConversationsByClient,
   updateClientStats,
 };
-```
-
-Luego también tienes que añadir `mongodb` al `package.json`. Ve a **`package.json`** → lápiz ✏️ → busca la línea:
-```
-"express": "^4.18.2",
-```
-
-Y añade justo debajo:
-```
-"mongodb": "^6.3.0",
